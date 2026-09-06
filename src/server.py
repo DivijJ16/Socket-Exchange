@@ -3,7 +3,7 @@ from select import *
 import sys
 
 socket_list = []
-clients = {} # map of clients socket to adress/role
+clients = {} # map of client's socket to adress/role
 clients_buffer = {}
 clients_role = {} 
 active_traders = {} #socket -> user
@@ -52,9 +52,52 @@ def disconnect(socket) :
     return  
   return
      
-#TODO : 
+def broadcast_trade(instr, qty, price):
+  msg = f"TRADE {instr} {qty} {price}\n"
+  finished_sockets = []
+  poss_sockets = market_clients.get(instr, set())
+  
+  for sock in poss_sockets:
+    try:
+      sock.sendall(msg.encode('utf-8'))
+    except Exception:
+      finished_sockets.append(sock)
+  
+  for sock in finished_sockets: # these sockets are no longer connected!
+    disconnect(sock)
+  
+ 
 def matching_eng(instr, side, price) :
-  pass
+  dual_side = "SELL" if side == "BUY" else "BUY"
+  my_orders = order_book[instr][side].get(price,[])
+  dual_orders = order_book[instr][dual_side].get(price,[])
+  
+  if not (my_orders and dual_orders):
+    return
+  while my_orders and dual_orders:
+    my_order = my_orders[0]
+    dual_order = dual_orders[0]
+    quant = min(my_order["quantity"], dual_order["quantity"])
+    
+    my_order["quantity"] -= quant
+    dual_order["quantity"] -= quant
+    
+    if my_order["quantity"] == 0:
+      my_orders.pop(0)
+      curr_orders.pop(my_order["id"],None)
+    if dual_order["quantity"] == 0:
+      dual_orders.pop(0)
+      curr_orders.pop(dual_order["id"],None)
+    
+    buyer_socket = my_order["socket"] if side == "BUY" else dual_order["socket"]
+    seller_socket = my_order["socket"] if side == "SELL" else dual_order["socket"]
+    
+    if buyer_socket in socket_list: #send notification to the traders whose order was executed
+      send_response(f"BOUGHT {instr} {quant} {price}\n", buyer_socket)
+    if seller_socket in socket_list:
+      send_response(f"SOLD {instr} {quant} {price}\n", seller_socket)
+      
+    broadcast_trade(instr,quant,price)
     
 def execute_trader_req(req, socket) :
   global order_counts
@@ -93,7 +136,7 @@ def execute_trader_req(req, socket) :
         if not (qty >= 1 and qty <= max_value and price >= 1 and price <= max_value) :
           send_response("ERROR Price and quantity for order needs to be in [1,2,147,483,647]\n", socket)
           return
-      except Exception as E :
+      except Exception as e :
         return
       id = order_counts
       order_counts += 1
@@ -102,7 +145,7 @@ def execute_trader_req(req, socket) :
       order_book[instr][wants].setdefault(price,[]).append(order)
       
       send_response(f"ORDER_ACCEPTED {id}\n", socket)
-      #TODO : matching_eng(instr, wants, price)
+      matching_eng(instr, wants, price)
     elif wants == 'CANCEL':
       if len(req) != 2 :
         send_response("ERROR Invalid Cancelling attempt\n", socket)
