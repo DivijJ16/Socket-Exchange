@@ -1,2 +1,2 @@
 #!/bin/sh
-exec python3 market_data.py "$@"
+exec python3 src/market_data.py "$@"
