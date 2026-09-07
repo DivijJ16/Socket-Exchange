@@ -1,4 +1,4 @@
-from select import select
+from select import select, kqueue , kevent,KQ_EV_ENABLE,KQ_FILTER_READ,KQ_EV_ADD , KQ_EV_EOF
 from socket import AF_INET, SO_REUSEADDR, SOL_SOCKET, SOCK_STREAM, socket
 import sys
 
@@ -9,6 +9,7 @@ clients_role = {}
 active_traders = {} #sock -> user
 all_traders = set() #all usernames
 order_counts = 0
+file_desc_to_socket = {}
 
 order_book = {"JNST":{"BUY":{},"SELL":{}}, "IMCT":{"BUY":{},"SELL":{}}}
 curr_orders = {} #order_id -> order
@@ -33,6 +34,7 @@ def disconnect(sock) :
   
   socket_list.remove(sock)
   clients.pop(sock,None)
+  file_desc_to_socket.pop(sock.fileno(),None)
   clients_buffer.pop(sock,None)
   role = clients_role.pop(sock,None)
   
@@ -240,28 +242,47 @@ def server(hostname, port):
   welcome_socket = socket(AF_INET, SOCK_STREAM)
   welcome_socket.setsockopt(SOL_SOCKET,SO_REUSEADDR,1) #for immediate reuse of port after server restart
   welcome_socket.bind((hostname,port))
-  welcome_socket.listen(20)
+  welcome_socket.listen(8000)
   welcome_socket.setblocking(False)
   
   socket_list.append(welcome_socket)
+  file_desc_to_socket[welcome_socket.fileno()] = welcome_socket
   
-  
+  kernel_q = kqueue()
+  kernel_event = kevent(welcome_socket.fileno(), filter= KQ_FILTER_READ, flags=KQ_EV_ADD | KQ_EV_ENABLE)
+  kernel_q.control([kernel_event],0,0)
   while 1:
     try :
-      read_sockets, _ , _ = select(socket_list, [], socket_list)
+      events = kernel_q.control(None, 1020, None)
     except Exception as e :
       continue
     
-    for sock in read_sockets:
+    for event in events:
+      file_desc = event.ident
+      if file_desc not in file_desc_to_socket:
+        continue
+      sock = file_desc_to_socket[file_desc]
+      
+      if event.flags & KQ_EV_EOF: # if kernel flags eof, client disconnects abruptly
+        disconnect(sock)
+        continue
+      
       if sock == welcome_socket: # if the server sock is ready, it means a new client is connecting
-        client_socket, client_addr = welcome_socket.accept()
-        client_socket.setblocking(False)
-        socket_list.append(client_socket)
-        clients[client_socket] = client_addr
-        clients_buffer[client_socket] = ""
+        for _ in range(event.data):
+          try:
+            client_socket, client_addr = welcome_socket.accept()
+            client_socket.setblocking(False)
+            socket_list.append(client_socket)
+            file_desc_to_socket[client_socket.fileno()] = client_socket
+            clients[client_socket] = client_addr
+            clients_buffer[client_socket] = ""
+            client_kev = kevent(client_socket.fileno(), filter=KQ_FILTER_READ, flags=KQ_EV_ADD | KQ_EV_ENABLE)
+            kernel_q.control([client_kev], 0, 0)
+          except Exception:
+            break
       else:  #an existing client sent data
         try:
-            data = sock.recv(1024)
+            data = sock.recv(4096)
             if data:
                 # sock.sendall(b"OK\n")
                 clients_buffer[sock] += data.decode('utf-8', errors = 'ignore')
