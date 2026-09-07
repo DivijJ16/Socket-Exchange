@@ -1,12 +1,13 @@
 from select import select
-from socket import socket, AF_INET, SOCK_STREAM
+from socket import socket, AF_INET, SOCK_STREAM, SHUT_WR
 import sys
 
-def trader(hostname, port, user):
+def trader(host, port, user):
     client_socket = socket(AF_INET, SOCK_STREAM)
     try:
-        client_socket.connect((hostname, port))
+        client_socket.connect((host, port))
     except Exception as e:
+        # print(f"Trader could not connect : {e}", file = sys.stderr)
         return
         
     if user :
@@ -16,8 +17,12 @@ def trader(hostname, port, user):
     
     while 1:
       try :
-        read_sockets , _, _ = select([sys.stdin, client_socket], [], [])
+        read_sockets, _, _ = select([sys.stdin, client_socket], [], [])
       except Exception :
+        try :
+          client_socket.close()
+        except Exception :
+          pass
         break
       
       for sock in read_sockets:
@@ -25,26 +30,59 @@ def trader(hostname, port, user):
           try:
             data = client_socket.recv(4096)
             if not data: # means connection was closed by server
-              client_socket.close()
+              try :
+                client_socket.close()
+              except Exception :
+                pass
               return
             recv_buff += data.decode('utf-8', errors='ignore')
             while "\n" in recv_buff:
               msg, recv_buff = recv_buff.split('\n',1)
               print(msg.strip())
             
-          except Exception as e:
+          except Exception:
+            try :
+              client_socket.close()
+            except Exception :
+              pass
             return
+          
         elif sock == sys.stdin:
           user_inp = sys.stdin.readline()
+          
           if not user_inp:
-            client_socket.close()
+            try :
+              client_socket.close()
+            except Exception :
+              pass
             return
+          
           try:
               client_socket.sendall(user_inp.encode('utf-8'))
           except Exception:
-              return
+            try :
+              client_socket.close()
+            except Exception :
+              pass
+            return
+          
           if user_inp.strip() == "QUIT":
-            client_socket.close()
+            try :
+              client_socket.shutdown(SHUT_WR)
+            except Exception :
+              pass
+            try :
+              while 1:
+                data = client_socket.recv(4096)
+                if not data :
+                  break
+            except Exception:
+              pass
+            
+            try :
+              client_socket.close()
+            except Exception :
+              pass
             return
               
 

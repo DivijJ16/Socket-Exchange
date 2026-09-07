@@ -1,9 +1,9 @@
-from select import select, kqueue , kevent,KQ_EV_ENABLE,KQ_FILTER_READ,KQ_EV_ADD , KQ_EV_EOF
-from socket import AF_INET, SO_REUSEADDR, SOL_SOCKET, SOCK_STREAM, socket
+from select import select, kqueue , kevent,KQ_EV_ENABLE,KQ_FILTER_READ,KQ_EV_ADD
+from socket import AF_INET, SO_REUSEADDR, SOL_SOCKET, SOCK_STREAM, socket, SHUT_RDWR
 import sys
 
 socket_list = []
-clients = {} # map of client's sock to adress/role
+clients = {} # map of client's sock to address
 clients_buffer = {}
 clients_role = {} 
 active_traders = {} #sock -> user
@@ -21,15 +21,15 @@ max_value = 2147483647
 def send_response(res, sock) :
   try :
     sock.sendall(res.encode('utf-8'))
-  except Exception as e :
+  except Exception :
     return
 
 def disconnect(sock) :
   if sock not in socket_list :
     try :
       sock.close()
-    except Exception as e :
-      return
+    except Exception :
+      pass
     return
   
   socket_list.remove(sock)
@@ -43,15 +43,17 @@ def disconnect(sock) :
     if user in all_traders :
       all_traders.remove(user)
   else :
-    if 'JNST' in market_clients :
-      market_clients['JNST'].discard(sock)
-    if 'IMCT' in market_clients :
-      market_clients['IMCT'].discard(sock)
-    
+    for instr in market_clients :
+      market_clients[instr].discard(sock)
+  
+  try :
+    sock.shutdown(SHUT_RDWR)
+  except Exception :
+    pass     
   try :
     sock.close()
-  except Exception as e :
-    return  
+  except Exception :
+    pass  
   return
      
 def broadcast_trade(instr, qty, price):
@@ -167,7 +169,7 @@ def execute_trader_req(req, sock) :
         return
       
       order = curr_orders[id]
-      if order['user'] != active_traders[sock] :
+      if order['sock'] != sock :
         send_response("ERROR Need to be owner to cancel order\n", sock)
         return
       
@@ -183,6 +185,7 @@ def execute_trader_req(req, sock) :
         
 def execute_market_data_req(req, sock) :
   wants = req[0]
+  # clients_role.setdefault(sock, "market_data")
   
   if wants == 'SUBSCRIBE' :
     if len(req) != 2 :
@@ -242,7 +245,7 @@ def server(hostname, port):
   welcome_socket = socket(AF_INET, SOCK_STREAM)
   welcome_socket.setsockopt(SOL_SOCKET,SO_REUSEADDR,1) #for immediate reuse of port after server restart
   welcome_socket.bind((hostname,port))
-  welcome_socket.listen(8000)
+  welcome_socket.listen(8000) 
   welcome_socket.setblocking(False)
   
   socket_list.append(welcome_socket)
@@ -253,8 +256,8 @@ def server(hostname, port):
   kernel_q.control([kernel_event],0,0)
   while 1:
     try :
-      events = kernel_q.control(None, 1020, None)
-    except Exception as e :
+      events = kernel_q.control(None, 10020, None)
+    except Exception :
       continue
     
     for event in events:
@@ -262,10 +265,6 @@ def server(hostname, port):
       if file_desc not in file_desc_to_socket:
         continue
       sock = file_desc_to_socket[file_desc]
-      
-      if event.flags & KQ_EV_EOF: # if kernel flags eof, client disconnects abruptly
-        disconnect(sock)
-        continue
       
       if sock == welcome_socket: # if the server sock is ready, it means a new client is connecting
         for _ in range(event.data):
@@ -279,12 +278,11 @@ def server(hostname, port):
             client_kev = kevent(client_socket.fileno(), filter=KQ_FILTER_READ, flags=KQ_EV_ADD | KQ_EV_ENABLE)
             kernel_q.control([client_kev], 0, 0)
           except Exception:
-            break
+            pass
       else:  #an existing client sent data
         try:
             data = sock.recv(4096)
             if data:
-                # sock.sendall(b"OK\n")
                 clients_buffer[sock] += data.decode('utf-8', errors = 'ignore')
                 
                 while '\n' in clients_buffer[sock] :
@@ -294,7 +292,7 @@ def server(hostname, port):
                     parse(req.strip(),sock) 
             else:  # empty data means the client closed the connection gracefully
                 disconnect(sock)
-        except Exception as e:
+        except Exception :
             disconnect(sock)
             
 if __name__ == "__main__":

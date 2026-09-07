@@ -1,4 +1,4 @@
-from socket import AF_INET, SOCK_STREAM, socket
+from socket import AF_INET, SOCK_STREAM, socket, SHUT_WR
 from select import select
 import sys
 
@@ -6,7 +6,8 @@ def market_client(hostname, port, instr) :
     market_client = socket(AF_INET, SOCK_STREAM)
     try :
         market_client.connect((hostname,port))
-    except Exception :
+    except Exception as e :
+        # print(f"MarketClient could not connect : {e}", file = sys.stderr)
         return
     
     if instr :
@@ -18,14 +19,21 @@ def market_client(hostname, port, instr) :
         try :
           read_sockets , _, _ = select([sys.stdin, market_client], [], [])
         except Exception :
-          break
+            try :
+              market_client.close()
+            except Exception :
+              pass
+            break
         
         for sock in read_sockets :
             if sock == market_client :
                 try:
                     data = market_client.recv(4096)
                     if not data: # means connection was closed by server
-                        market_client.close()
+                        try :
+                          market_client.close()
+                        except Exception :
+                          pass
                         return
                     recv_buff += data.decode('utf-8', errors='ignore')
                     while "\n" in recv_buff:
@@ -33,20 +41,48 @@ def market_client(hostname, port, instr) :
                         print(msg.strip())
 
                 except Exception :
-                    market_client.close()
+                    try :
+                      market_client.close()
+                    except Exception :
+                      pass
                     return
+                
             elif sock == sys.stdin :
                 user_inp = sys.stdin.readline()
                 if not user_inp:
-                  market_client.close()
+                  try :
+                    market_client.close()
+                  except Exception :
+                    pass
                   return
+              
                 try:
                     market_client.sendall(user_inp.encode('utf-8'))
                 except Exception:
+                    try :
+                      market_client.close()
+                    except Exception :
+                      pass
                     return
+                  
                 if user_inp.strip() == "QUIT":
-                  market_client.close()
-                  return
+                    try :
+                      market_client.shutdown(SHUT_WR)
+                    except Exception :
+                      pass
+                    try :
+                      while 1:
+                        data = market_client.recv(4096)
+                        if not data :
+                          break
+                    except Exception:
+                      pass
+                  
+                    try :
+                      market_client.close()
+                    except Exception :
+                      pass
+                    return
         
 if __name__ == "__main__" :
     instr = None
