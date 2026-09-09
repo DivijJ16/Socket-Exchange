@@ -1,4 +1,4 @@
-from select import select, kqueue , kevent,KQ_EV_ENABLE,KQ_FILTER_READ,KQ_EV_ADD
+from select import kqueue, kevent, KQ_EV_ENABLE, KQ_FILTER_READ, KQ_EV_ADD, KQ_FILTER_WRITE, KQ_EV_DELETE
 from socket import AF_INET, SO_REUSEADDR, SOL_SOCKET, SOCK_STREAM, socket, SHUT_RDWR
 import sys
 
@@ -10,21 +10,85 @@ active_traders = {} #sock -> user
 all_traders = set() #all usernames
 order_counts = 0
 file_desc_to_socket = {}
+file_desc_gen = {}
+next_gen = 0
 
 order_book = {"JNST":{"BUY":{},"SELL":{}}, "IMCT":{"BUY":{},"SELL":{}}}
 curr_orders = {} #order_id -> order
 
 market_clients = {} #instr -> set of sockets
 
+send_buff = {}
+kernel_q = None
+
 max_value = 2147483647
 
 def send_response(res, sock) :
-  try :
-    sock.sendall(res.encode('utf-8'))
-  except Exception :
+  if sock not in socket_list or kernel_q is None :
+    return
+  
+  res = res.encode('utf-8')
+  res = send_buff.get(sock,b"") + res
+  
+  pending_before = sock in send_buff
+  
+  if not sock in send_buff :
+    try :
+      n = sock.send(res)
+    except BlockingIOError :
+      n = 0
+    except Exception :
+      disconnect(sock)
+      return
+    res = res[n:]
+   
+  if not res :
+    send_buff.pop(sock,None)
     return
 
+  send_buff[sock] = res
+  
+  if not pending_before :
+    try :
+      kernel_q.control([kevent(sock.fileno(), filter = KQ_FILTER_WRITE, flags = KQ_EV_ADD|KQ_EV_ENABLE,udata=file_desc_gen.get(sock.fileno()))],0,0)
+    except Exception :
+      disconnect(sock)
+
+def pending_sends(sock) :
+  if kernel_q is None :
+    return
+  
+  res = send_buff.get(sock)
+  
+  if not res :
+    try :
+      kernel_q.control([kevent(sock.fileno(), filter = KQ_FILTER_WRITE, flags = KQ_EV_DELETE)],0,0)
+    except Exception :
+      pass
+    send_buff.pop(sock,None)
+    return
+  
+  try :
+    n = sock.send(res)
+    res = res[n:]
+  except BlockingIOError :
+    return
+  except Exception :
+    disconnect(sock)
+    return
+  
+  if res :
+    send_buff[sock] = res
+  else :
+    send_buff.pop(sock,None)
+    try :
+      kernel_q.control([kevent(sock.fileno(), filter = KQ_FILTER_WRITE, flags = KQ_EV_DELETE)],0,0)
+    except Exception :
+      pass
+  
 def disconnect(sock) :
+  send_buff.pop(sock,None)
+  
   if sock not in socket_list :
     try :
       sock.close()
@@ -35,6 +99,7 @@ def disconnect(sock) :
   socket_list.remove(sock)
   clients.pop(sock,None)
   file_desc_to_socket.pop(sock.fileno(),None)
+  file_desc_gen.pop(sock.fileno(),None)
   clients_buffer.pop(sock,None)
   role = clients_role.pop(sock,None)
   
@@ -54,21 +119,7 @@ def disconnect(sock) :
     sock.close()
   except Exception :
     pass  
-  return
-     
-def broadcast_trade(instr, qty, price):
-  resp = f"TRADE {instr} {qty} {price}\n"
-  unsubs = []
-  subs_sockets = market_clients.get(instr, set())
-  
-  for sock in subs_sockets:
-    try:
-      sock.sendall(resp.encode('utf-8'))
-    except Exception:
-      unsubs.append(sock)
-  
-  for sock in unsubs: # these sockets are no longer connected!
-    disconnect(sock)
+  return  
  
 def matching_eng(instr, side, price) :
   dual_side = "SELL" if side == "BUY" else "BUY"
@@ -89,9 +140,16 @@ def matching_eng(instr, side, price) :
     if my_order["quantity"] == 0:
       my_orders.pop(0)
       curr_orders.pop(my_order["id"],None)
+      
+      if not my_orders :
+        order_book[instr][side].pop(price,None)
+        
     if dual_order["quantity"] == 0:
       dual_orders.pop(0)
       curr_orders.pop(dual_order["id"],None)
+      
+      if not dual_orders :
+        order_book[instr][dual_side].pop(price,None)
     
     buyer_socket = my_order["sock"] if side == "BUY" else dual_order["sock"]
     seller_socket = my_order["sock"] if side == "SELL" else dual_order["sock"]
@@ -101,11 +159,14 @@ def matching_eng(instr, side, price) :
     if seller_socket in socket_list:
       send_response(f"SOLD {instr} {qty} {price}\n", seller_socket)
       
-    broadcast_trade(instr,qty,price)
+    resp = f"TRADE {instr} {qty} {price}\n" 
+    for sock in list(market_clients.get(instr, set())):
+      send_response(resp,sock)
     
 def execute_trader_req(req, sock) :
   global order_counts
   wants = req[0]
+  # clients_role[sock] = 'trader'
   
   if wants == 'LOGIN' :
     if len(req) != 2 :
@@ -177,6 +238,10 @@ def execute_trader_req(req, sock) :
       curr_orders.pop(id,None)
       if price in order_book[instr][side] :
         order_book[instr][side][price] = [ord for ord in order_book[instr][side][price] if ord["id"] != id]
+        
+        if not order_book[instr][side][price] :
+          order_book[instr][side].pop(price,None)
+          
       send_response(f"ORDER_CANCELLED {id}\n", sock)
     elif wants == 'QUIT' :
       disconnect(sock)
@@ -185,7 +250,7 @@ def execute_trader_req(req, sock) :
         
 def execute_market_data_req(req, sock) :
   wants = req[0]
-  # clients_role.setdefault(sock, "market_data")
+  # clients_role[sock] = "market_data"
   
   if wants == 'SUBSCRIBE' :
     if len(req) != 2 :
@@ -242,6 +307,8 @@ def parse(req, sock) :
   return
 
 def server(hostname, port):
+  global kernel_q, next_gen
+  
   welcome_socket = socket(AF_INET, SOCK_STREAM)
   welcome_socket.setsockopt(SOL_SOCKET,SO_REUSEADDR,1) #for immediate reuse of port after server restart
   welcome_socket.bind((hostname,port))
@@ -250,13 +317,16 @@ def server(hostname, port):
   
   socket_list.append(welcome_socket)
   file_desc_to_socket[welcome_socket.fileno()] = welcome_socket
+  file_desc_gen[welcome_socket.fileno()] = 0
   
   kernel_q = kqueue()
   kernel_event = kevent(welcome_socket.fileno(), filter= KQ_FILTER_READ, flags=KQ_EV_ADD | KQ_EV_ENABLE)
   kernel_q.control([kernel_event],0,0)
   while 1:
     try :
+      # print("waiting on kqueue control", flush=True)
       events = kernel_q.control(None, 10020, None)
+      # print(f"woke up with {len(events)} events", flush=True)
     except Exception :
       continue
     
@@ -264,7 +334,15 @@ def server(hostname, port):
       file_desc = event.ident
       if file_desc not in file_desc_to_socket:
         continue
+      
+      if event.filter != KQ_FILTER_WRITE and file_desc_gen.get(file_desc) != event.udata :
+        continue
+      
       sock = file_desc_to_socket[file_desc]
+      
+      if event.filter == KQ_FILTER_WRITE :
+        pending_sends(sock)
+        continue
       
       if sock == welcome_socket: # if the server sock is ready, it means a new client is connecting
         for _ in range(event.data):
@@ -273,26 +351,33 @@ def server(hostname, port):
             client_socket.setblocking(False)
             socket_list.append(client_socket)
             file_desc_to_socket[client_socket.fileno()] = client_socket
+            next_gen += 1
+            file_desc_gen[client_socket.fileno()] = next_gen 
             clients[client_socket] = client_addr
             clients_buffer[client_socket] = ""
-            client_kev = kevent(client_socket.fileno(), filter=KQ_FILTER_READ, flags=KQ_EV_ADD | KQ_EV_ENABLE)
+            client_kev = kevent(client_socket.fileno(), filter=KQ_FILTER_READ, flags=KQ_EV_ADD | KQ_EV_ENABLE, udata=next_gen)
             kernel_q.control([client_kev], 0, 0)
           except Exception:
             pass
       else:  #an existing client sent data
         try:
             data = sock.recv(4096)
+            # print(f"Received fd={sock.fileno()} bytes={len(data)}", flush=True)
             if data:
                 clients_buffer[sock] += data.decode('utf-8', errors = 'ignore')
+                # print(f"Server received : {data}", flush=True)
                 
-                while '\n' in clients_buffer[sock] :
+                while sock in clients_buffer and '\n' in clients_buffer[sock] :
                   #parse all the fully received req
                   req, clients_buffer[sock] = clients_buffer[sock].split('\n',1)
                   if req.strip() :
+                    # print(f"Parsed fd={sock.fileno()} msg={req.strip()!r}", flush=True)       
                     parse(req.strip(),sock) 
             else:  # empty data means the client closed the connection gracefully
+                # print(f"Received fd={sock.fileno()} bytes=0 (orderly fin)", flush=True)       
                 disconnect(sock)
         except Exception :
+            # print(f"Received fd={sock.fileno()} bytes=0 (abrupt reset)", flush=True)       
             disconnect(sock)
             
 if __name__ == "__main__":
